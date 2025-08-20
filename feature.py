@@ -124,15 +124,17 @@ class TimeSeriesFeatureEngineer:
         print(f"  ✓ 创建了 {len(new_features)} 个时间特征")
         return df_result
 
-class kalmanFilterModel:
-    def __init__(self):
-        pass
 
     def apply_kalman_filter(self, series, Q = 1e-5, R = 0.1):
 
-        from filterpy.kalman import KalmanFilter
+        try:
+            from filterpy.kalman import KalmanFilter
+        except ImportError:
+            print("WARNING: filterpy is not installed")
+            return series
+
         # 初始化卡尔曼滤波器
-        kf = KalmanFilter(dim_x=len(series), dim_z=1)
+        kf = KalmanFilter(dim_x=2, dim_z=1)
         # 状态转移矩阵
         kf.F = np.array([[1, 1],
                          [0,1]])
@@ -147,7 +149,7 @@ class kalmanFilterModel:
                          [0, Q]])
 
         # 初始状态估计
-        kf.x = np.array([series.iloc[0],0])
+        kf.x = np.array([series.iloc[0] if not pd.isna(series.iloc[0]) else 0, 0])
 
         kf.P *= 100
 
@@ -159,32 +161,6 @@ class kalmanFilterModel:
             filtered_values.append(kf.x[0]) # 获取滤波后状态
 
         return pd.Series(filtered_values, index = series.index)
-
-    def grid_search(self, series, param_grid):
-        """
-        使用网格搜索来选择最优的Q与R
-        :param series: 输入的时间序列数据
-        :param param_grid: 包含Q与R参数的字典
-        :return: 最优Q与R组合及其对应的性能
-        """
-
-        best_params = None
-        best_score = float('inf')
-        best_filtered_values = None
-
-        for Q in param_grid['Q']:
-            for R in param_grid['R']:
-                # 获取滤波结果
-                filtered_series = self.apply_kalman_filter(series, Q, R)
-                # 计算MSE最为评估标准
-                mse = mean_squared_error(series, filtered_series)
-
-                if mse < best_score:
-                    best_score = mse
-                    best_params = {'Q':Q, 'R':R}
-                    best_filtered_values = filtered_series
-
-        return best_params, best_score, best_filtered_values
 
 
     def optimize_kalman_filter(self, series, asset1_series, asset2_series,
@@ -204,6 +180,58 @@ class kalmanFilterModel:
         """
         from sklearn.metrics import mean_squared_error
         import itertools
+
+        best_score = float('inf')
+        best_Q = Q_range[0]
+        best_R = R_range[0]
+
+        # 使用后20%作为验证集
+        split_idx = int(len(series) * 0.8)
+
+        for Q, R in itertools.product(Q_range, R_range):
+            try:
+                filtered_series = self.apply_kalman_filter(series, Q=Q, R=R)
+
+                # 计算评估指标
+                # 1.平滑度：滤波后序列的二阶差分的标准差
+                smoothness = filtered.diff().diff().std()
+
+                # 2.跟踪误差：滤波值与原始值的差异
+                tracking_error = mean_squared_error(
+                    series.iloc[split_idx:].fillna(0),
+                    filtered_iloc[split_idx:].fillna(0)
+                )
+
+                # 3.协整性：检查滤波后的价差是否更加稳定
+                stability = filtered.iloc[split_idx:].std()
+
+                # 4.预测能力
+                ma = filtered.rolling(window=20, min_periods=1).mean()
+                std = filtered.rolling(window=20, min_periods=1).std()
+                z_score = (filtered - ma) / (std + 1e-8)
+
+                # 当z score极端时，期望价差回归均值
+                # 计算信号与未来收益的相关性
+                future_returns = series.shift(-5).pct_change(5)
+                signal_quality = abs(z_score.iloc[split_idx:-5].corr(future_returns.iloc[split_idx:-5]))
+
+                # 综合评分
+                score = (
+                    0.2 * smoothness +
+                    0.2 * tracking_error +
+                    0.3 * stability +
+                    0.3 * (1-signal_quality) if not pd.isna(signal_quality) else 1.0
+                )
+
+                if score < best_score:
+                    best_score = score
+                    best_Q = Q
+                    best_R = R
+
+            except Exception as e:
+                continue
+
+        return best_Q, best_R, best_score
 
 
     def create_cross_sectional_features(self, df, feature_groups=None, pairs_file='target_pairs.csv'):
@@ -268,6 +296,7 @@ class kalmanFilterModel:
 
         # 读取资产对信息
         key_pairs = []
+        spread_pairs = []
         try:
             import os
             if os.path.exists(pairs_file):
@@ -295,7 +324,9 @@ class kalmanFilterModel:
                             cols1 = [col for col in df.columns if asset1 in col or col in asset1]
                             cols2 = [col for col in df.columns if asset2 in col or col in asset2]
                             if cols1 and cols2:
+                                spread_pairs.append((cols1[0], cols2[0], idx))
                                 key_pairs.append((cols1[0], cols2[0]))
+
 
                     else:
                         # 单个资产的情况，需要找另一个相关资产配对
@@ -311,6 +342,7 @@ class kalmanFilterModel:
                 # 去重
                 key_pairs = list(set(key_pairs))
                 print(f"    成功构建了 {len(key_pairs)} 个唯一资产对")
+                print(f"    其中 {len(spread_pairs)} 个价差对")
 
             else:
                 print(f"    警告：未找到 {pairs_file}，使用默认资产对")
@@ -329,6 +361,37 @@ class kalmanFilterModel:
                 ('US_Stock_XLE_adj_close', 'US_Stock_CVX_adj_close'),
                 ('LME_AH_Close', 'US_Stock_FCX_adj_close'),
             ]
+
+        # 创建价差特征
+        if use_kalman:
+            print("应用卡尔曼滤波到价差")
+
+            try:
+                from filterpy.kalman import KalmanFilter
+                kalman_available = True
+            except ImportError:
+                print("filterpy未安装，跳过卡尔曼滤波，请运行 pip install filterpy")
+                kalman_available = False
+        else:
+            kalman_available = False
+
+        kalman_params = {}
+
+        for i, (asset1, asset2, idx) in enumerate(spread_pairs[:50]):
+            if asset1 in df.columns and asset2 in df.columns:
+
+                spread = df[asset1] - df[asset2]
+
+            if kalman_available and use_kalman:
+                if optimize_kalman:
+
+                    if i % 10 ==0:
+                        print(f"  优化第{i+1}/{min(50, len(spread_pairs))}个价差对的卡尔曼参数")
+
+                    best_Q, best_R, best_score = self.optimize_kalman_parameters(
+                        spread, df[asset1], df[asset2],
+                        Q_range = Q_range, R_range = R_range
+                    )
 
         # 创建滚动相关性特征
         correlation_count = 0
